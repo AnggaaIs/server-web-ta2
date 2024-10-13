@@ -9,7 +9,7 @@ const sensorDataSchema = new mongoose.Schema({
         type: Number,
         required: true
     },
-    jarak: {
+    kelembaban: {
         type: Number,
         required: true
     },
