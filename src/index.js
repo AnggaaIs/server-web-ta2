@@ -36,35 +36,75 @@ app.get('/', async (req, res) => {
     res.status(200).json({ message: "halo" })
 })
 
-wss.on('connection', function connection(ws) {
+
+wss.on('connection', function connection(ws, req) {
     const clientId = Date.now();
     let saveInterval;
-    let dataObj; // Variabel untuk menyimpan data terbaru
-    clients.set(clientId, ws);
-    console.log(`Klien terhubung dengan ID: ${clientId}`);
+    let dataObj;
 
-    // Mulai interval penyimpanan data segera setelah klien terhubung
+    const clientIP = req.socket.remoteAddress;
+    clients.set(clientId, ws);
+
+    console.log(`🟢 [CONNECT] Klien terhubung | ID: ${clientId} | IP: ${clientIP}`);
+
     saveInterval = setInterval(saveDataToMongoDB, 300_000);
 
     ws.on('message', function incoming(message) {
-        dataObj = JSON.parse(String(message).replace(/\r\n/g, ''));
-        dataObj = cleanJsonData(dataObj)
-        if (!dataObj.kelembaban || dataObj.suhu == 0 || !dataObj.jarak) return;
+        try {
+            console.log(`📨 [MESSAGE] dari client ${clientId}: ${message.toString()}`);
+            dataObj = JSON.parse(String(message).replace(/\r\n/g, ''));
+            dataObj = cleanJsonData(dataObj);
 
-        // 2. Membersihkan Data
-        dataObj.kelembaban = parseInt(dataObj.kelembaban);
-        dataObj.suhu = parseFloat(dataObj.suhu);
-        dataObj.kapasitas = parseInt(dataObj.jarak);
-
-        // Meneruskan pesan ke semua klien kecuali pengirim
-        clients.forEach((client, id) => {
-            if (id !== clientId && client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify(dataObj));
+            if (!dataObj.kelembaban ||
+                dataObj.suhu === null || isNaN(dataObj.suhu)
+                // jangan cek jarak === 0 karena jarak boleh 0
+            ) {
+                console.log(`⚠️ [SKIP] Data tidak valid dari client ${clientId}`, dataObj);
+                return;
             }
-        });
+
+
+            dataObj.kelembaban = parseInt(dataObj.kelembaban);
+            dataObj.suhu = parseFloat(dataObj.suhu);
+            dataObj.kapasitas = parseInt(dataObj.jarak);
+
+            // Kirim data ke semua client lain
+            clients.forEach((client, id) => {
+                if (id !== clientId && client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify(dataObj));
+                    console.log(`📤 [FORWARD] ke client ${id}`);
+                }
+            });
+        } catch (err) {
+            console.error(`❌ [ERROR] Parsing message dari client ${clientId}: ${err.message}`);
+        }
     });
 
-    // Fungsi untuk menyimpan data ke MongoDB
+    ws.on('close', (code, reason) => {
+        clients.delete(clientId);
+        clearInterval(saveInterval);
+        console.log(`🔴 [DISCONNECT] Client ${clientId} putus | Code: ${code} | Reason: ${reason}`);
+    });
+
+    ws.on('error', (error) => {
+        console.error(`❌ [SOCKET ERROR] Client ${clientId}: ${error.message}`);
+    });
+
+    // Ping-pong log
+    ws.on('pong', () => {
+        console.log(`🏓 [PONG] dari client ${clientId}`);
+    });
+
+    // Ping setiap 30 detik
+    const pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.ping();
+            console.log(`📡 [PING] ke client ${clientId}`);
+        } else {
+            clearInterval(pingInterval);
+        }
+    }, 30000);
+
     function saveDataToMongoDB() {
         if (
             !dataObj ||
@@ -83,62 +123,51 @@ wss.on('connection', function connection(ws) {
             .then(() => console.log('Data sensor berhasil disimpan ke MongoDB'))
             .catch(err => console.error('Error menyimpan data sensor:', err));
     }
-
-
-    ws.on('close', () => {
-        clients.delete(clientId);
-        console.log(`Klien dengan ID: ${clientId} terputus`);
-        clearInterval(saveInterval);
-    });
-
-    // Menangani error
-    ws.on('error', (error) => {
-        console.error(`Error pada klien ${clientId}: ${error.message}`);
-    });
-
-    //  Ping klien secara berkala untuk memeriksa koneksi
-    const pingInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.ping();
-        } else {
-            clearInterval(pingInterval);
-        }
-    }, 30000); // Ping setiap 30 detik
 });
+
 
 server.listen(PORT, () => {
     console.log(`Server berjalan di port ${PORT}`);
 });
 
 function cleanJsonData(inputJson) {
-    const cleanedJson = { ...inputJson };
+    const cleanedJson = {};
 
     // Fungsi untuk mengambil angka pertama dalam string
     const extractFirstNumber = (value) => {
         if (typeof value === "string") {
-            const match = value.match(/\d+/);
-            return match ? parseInt(match[0], 10) : null; // Ambil angka pertama atau null jika tidak ada
+            const match = value.match(/\d+(\.\d+)?/); // ambil angka integer atau desimal pertama
+            return match ? parseFloat(match[0]) : null;
+        } else if (typeof value === "number") {
+            return value;
         }
-        return value; // Jika bukan string, kembalikan nilai aslinya
+        return null;
     };
 
     // Fungsi untuk mengubah "on" menjadi true dan "off" menjadi false
-    const cleanValue = (value) => {
+    const extractOnOff = (value) => {
         if (typeof value === "string") {
-            const match = value.match(/\b(on|off)\b/);
+            const match = value.match(/\b(on|off)\b/i);
             if (match) {
-                return match[0] === "on"; // true jika "on", false jika "off"
+                return match[0].toLowerCase() === "on";
             }
         }
-        return null; // Jika tidak ditemukan, kembalikan null
+        return null;
     };
 
-    // Bersihkan data
-    cleanedJson.kelembaban = extractFirstNumber(cleanedJson.kelembaban);
-    cleanedJson.jarak = extractFirstNumber(cleanedJson.jarak);
-    cleanedJson.motor_1 = cleanValue(cleanedJson.motor_1);
-    cleanedJson.motor_2 = cleanValue(cleanedJson.motor_2);
-    cleanedJson.stepper = cleanValue(cleanedJson.stepper);
+    // Ambil data kelembaban (angka pertama dari string/number)
+    cleanedJson.kelembaban = extractFirstNumber(inputJson.kelembaban);
+
+    // Ambil data suhu (angka pertama dari string/number)
+    cleanedJson.suhu = extractFirstNumber(inputJson.suhu);
+
+    // Ambil data jarak (kapasitas) (angka pertama)
+    cleanedJson.jarak = extractFirstNumber(inputJson.jarak);
+
+    // Motor dan stepper, ambil on/off saja
+    cleanedJson.motor_1 = extractOnOff(inputJson.motor_1);
+    cleanedJson.motor_2 = extractOnOff(inputJson.motor_2);
+    cleanedJson.stepper = extractOnOff(inputJson.stepper);
 
     return cleanedJson;
 }
