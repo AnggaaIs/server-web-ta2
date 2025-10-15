@@ -47,15 +47,15 @@ wss.on('connection', function connection(ws, req) {
 
     console.log(`🟢 [CONNECT] Klien terhubung | ID: ${clientId} | IP: ${clientIP}`);
 
-    saveInterval = setInterval(saveDataToMongoDB, 300_000);
+    saveInterval = setInterval(saveDataToMongoDB, 5 * 60_000);
 
     ws.on('message', function incoming(message) {
         try {
-            console.log(`📨 [MESSAGE] dari client ${clientId}: ${message.toString()}`);
+            // console.log(`📨 [MESSAGE] dari client ${clientId}: ${message.toString()}`);
             dataObj = JSON.parse(String(message).replace(/\r\n/g, ''));
             dataObj = cleanJsonData(dataObj);
 
-            if (!dataObj.kelembaban ||
+            if (isNaN(dataObj.kelembaban) || dataObj.kelembaban == null ||
                 dataObj.suhu === null || isNaN(dataObj.suhu)
                 // jangan cek jarak === 0 karena jarak boleh 0
             ) {
@@ -120,7 +120,7 @@ wss.on('connection', function connection(ws, req) {
         });
 
         newData.save()
-            .then(() => console.log('Data sensor berhasil disimpan ke MongoDB'))
+            .then((data) => console.log('Data sensor berhasil disimpan ke MongoDB', data))
             .catch(err => console.error('Error menyimpan data sensor:', err));
     }
 });
