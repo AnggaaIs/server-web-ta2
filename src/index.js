@@ -54,27 +54,25 @@ wss.on("connection", function connection(ws, req) {
 
   ws.on("message", function incoming(message) {
     try {
-      // console.log(`📨 [MESSAGE] dari client ${clientId}: ${message.toString()}`);
+      console.log(`📨 [MESSAGE] dari client ${clientId}: ${message.toString()}`);
       dataObj = JSON.parse(String(message).replace(/\r\n/g, ""));
-      dataObj = cleanJsonData(dataObj);
 
       if (
-        isNaN(dataObj.kelembaban) ||
-        dataObj.kelembaban == null ||
-        dataObj.suhu === null ||
-        isNaN(dataObj.suhu)
-        // jangan cek jarak === 0 karena jarak boleh 0
+        dataObj.kelembaban === undefined ||
+        dataObj.suhu === undefined ||
+        dataObj.jarak === undefined
       ) {
         console.log(
-          `⚠️ [SKIP] Data tidak valid dari client ${clientId}`,
+          `⚠️ [SKIP] Data tidak lengkap dari client ${clientId}`,
           dataObj,
         );
         return;
       }
 
+      // Pastikan format tipe data benar untuk diteruskan ke frontend
       dataObj.kelembaban = parseInt(dataObj.kelembaban);
       dataObj.suhu = parseFloat(dataObj.suhu);
-      dataObj.kapasitas = parseInt(dataObj.jarak);
+      dataObj.kapasitas = parseInt(dataObj.jarak); // Frontend mengharapkan 'kapasitas'
 
       // Kirim data ke semua client lain
       clients.forEach((client, id) => {
@@ -145,47 +143,3 @@ wss.on("connection", function connection(ws, req) {
 server.listen(PORT, () => {
   console.log(`Server berjalan di port ${PORT}`);
 });
-
-function cleanJsonData(inputJson) {
-  const cleanedJson = {};
-
-  // Fungsi untuk mengambil angka pertama dalam string
-  const extractFirstNumber = (value) => {
-    if (typeof value === "string") {
-      const match = value.match(/\d+(\.\d+)?/); // ambil angka integer atau desimal pertama
-      return match ? parseFloat(match[0]) : null;
-    } else if (typeof value === "number") {
-      return value;
-    }
-    return null;
-  };
-
-  // Fungsi untuk mengubah "on" menjadi true dan "off" menjadi false
-  const extractOnOff = (value) => {
-    if (typeof value === "string") {
-      const match = value.match(/\b(on|off)\b/i);
-      if (match) {
-        return match[0].toLowerCase() === "on";
-      }
-    }
-    return null;
-  };
-
-  // Ambil data kelembaban (angka pertama dari string/number)
-  cleanedJson.kelembaban = extractFirstNumber(inputJson.kelembaban);
-
-  // Ambil data suhu (angka pertama dari string/number)
-  cleanedJson.suhu = extractFirstNumber(inputJson.suhu);
-
-  // Ambil data jarak (kapasitas) (angka pertama)
-  cleanedJson.jarak = extractFirstNumber(inputJson.jarak);
-
-  // Motor dan stepper, ambil on/off saja
-  cleanedJson.motor_1 = extractOnOff(inputJson.motor_1);
-  cleanedJson.motor_2 = extractOnOff(inputJson.motor_2);
-  cleanedJson.stepper = extractOnOff(inputJson.stepper);
-  cleanedJson.kapasitas_penuh =
-    inputJson.kapasitas_penuh === true || inputJson.kapasitas_penuh === "true";
-
-  return cleanedJson;
-}
