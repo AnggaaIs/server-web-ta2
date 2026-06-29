@@ -11,16 +11,18 @@ const app = express();
 const server = http.createServer(app);
 
 app.use(cors());
+app.use(express.json());
 
 const wss = new WebSocket.Server({ server });
-
 const clients = new Map();
+const pingIntervals = new Map();
+
+const MONGODB_URI =
+  process.env.MONGODB_URI ||
+  "mongodb+srv://tasya:tasya@pupuk-kompos.1pmdy.mongodb.net/?retryWrites=true&w=majority&appName=pupuk-kompos";
 
 mongoose
-  .connect(
-    "mongodb+srv://tasya:tasya@pupuk-kompos.1pmdy.mongodb.net/?retryWrites=true&w=majority&appName=pupuk-kompos",
-    {},
-  )
+  .connect(MONGODB_URI, {})
   .then(() => console.log("Terhubung ke MongoDB"))
   .catch((err) => console.error("Error koneksi MongoDB:", err));
 
@@ -38,49 +40,97 @@ app.get("/", async (req, res) => {
   res.status(200).json({ message: "halo" });
 });
 
+function parseNumber(value) {
+  const parsed = typeof value === "string" ? Number(value) : value;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeStatus(value) {
+  if (typeof value === "string") {
+    return value.toLowerCase() === "on" ? "on" : "off";
+  }
+
+  return value ? "on" : "off";
+}
+
+function normalizePump(pump = {}) {
+  return {
+    status: normalizeStatus(pump.status),
+    water_level: parseNumber(pump.water_level),
+  };
+}
+
+function normalizePayload(rawMessage) {
+  const rawText = String(rawMessage).replace(/\r\n/g, "");
+  const payload = JSON.parse(rawText);
+
+  const kelembaban = parseNumber(payload.kelembaban);
+  const suhu = parseNumber(payload.suhu);
+  const jarak = parseNumber(payload.jarak ?? payload.kapasitas ?? payload.volume);
+
+  if (kelembaban === null || suhu === null || jarak === null) {
+    return null;
+  }
+
+  const waterPump1 = normalizePump(payload.water_pump_1);
+  const waterPump2 = normalizePump(payload.water_pump_2);
+  const stepper = normalizeStatus(payload.stepper);
+  const kapasitasPenuh =
+    typeof payload.kapasitas_penuh === "boolean"
+      ? payload.kapasitas_penuh
+      : jarak >= 70;
+
+  return {
+    kelembaban,
+    suhu,
+    jarak,
+    kapasitas: jarak,
+    water_pump_1: waterPump1,
+    water_pump_2: waterPump2,
+    stepper,
+    kapasitas_penuh: kapasitasPenuh,
+    timestamp: new Date(),
+  };
+}
+
+function broadcastToOtherClients(senderId, dataObj) {
+  const payload = JSON.stringify(dataObj);
+
+  clients.forEach((client, id) => {
+    if (id !== senderId && client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+      console.log(`📤 [FORWARD] ke client ${id}`);
+    }
+  });
+}
+
 wss.on("connection", function connection(ws, req) {
   const clientId = Date.now();
-  let saveInterval;
-  let dataObj;
-
   const clientIP = req.socket.remoteAddress;
-  clients.set(clientId, ws);
 
+  clients.set(clientId, ws);
   console.log(
     `🟢 [CONNECT] Klien terhubung | ID: ${clientId} | IP: ${clientIP}`,
   );
 
-  saveInterval = setInterval(saveDataToMongoDB, 5 * 60_000);
-
-  ws.on("message", function incoming(message) {
+  ws.on("message", async function incoming(message) {
     try {
       console.log(`📨 [MESSAGE] dari client ${clientId}: ${message.toString()}`);
-      dataObj = JSON.parse(String(message).replace(/\r\n/g, ""));
 
-      if (
-        dataObj.kelembaban === undefined ||
-        dataObj.suhu === undefined ||
-        dataObj.jarak === undefined
-      ) {
+      const dataObj = normalizePayload(message);
+
+      if (!dataObj) {
         console.log(
-          `⚠️ [SKIP] Data tidak lengkap dari client ${clientId}`,
-          dataObj,
+          `⚠️ [SKIP] Data tidak lengkap/tidak valid dari client ${clientId}`,
         );
         return;
       }
 
-      // Pastikan format tipe data benar untuk diteruskan ke frontend
-      dataObj.kelembaban = parseInt(dataObj.kelembaban);
-      dataObj.suhu = parseFloat(dataObj.suhu);
-      dataObj.kapasitas = parseInt(dataObj.jarak); // Frontend mengharapkan 'kapasitas'
+      const newData = new SensorData(dataObj);
+      await newData.save();
 
-      // Kirim data ke semua client lain
-      clients.forEach((client, id) => {
-        if (id !== clientId && client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify(dataObj));
-          console.log(`📤 [FORWARD] ke client ${id}`);
-        }
-      });
+      broadcastToOtherClients(clientId, dataObj);
+      console.log("Data sensor berhasil disimpan ke MongoDB");
     } catch (err) {
       console.error(
         `❌ [ERROR] Parsing message dari client ${clientId}: ${err.message}`,
@@ -90,7 +140,13 @@ wss.on("connection", function connection(ws, req) {
 
   ws.on("close", (code, reason) => {
     clients.delete(clientId);
-    clearInterval(saveInterval);
+
+    const pingInterval = pingIntervals.get(clientId);
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingIntervals.delete(clientId);
+    }
+
     console.log(
       `🔴 [DISCONNECT] Client ${clientId} putus | Code: ${code} | Reason: ${reason}`,
     );
@@ -100,44 +156,21 @@ wss.on("connection", function connection(ws, req) {
     console.error(`❌ [SOCKET ERROR] Client ${clientId}: ${error.message}`);
   });
 
-  // Ping-pong log
   ws.on("pong", () => {
     console.log(`🏓 [PONG] dari client ${clientId}`);
   });
 
-  // Ping setiap 30 detik
   const pingInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.ping();
       console.log(`📡 [PING] ke client ${clientId}`);
     } else {
       clearInterval(pingInterval);
+      pingIntervals.delete(clientId);
     }
   }, 30000);
 
-  function saveDataToMongoDB() {
-    if (
-      !dataObj ||
-      isNaN(dataObj.kelembaban) ||
-      isNaN(dataObj.suhu) ||
-      isNaN(dataObj.jarak)
-    )
-      return;
-
-    const newData = new SensorData({
-      kelembaban: dataObj.kelembaban,
-      suhu: dataObj.suhu,
-      kapasitas: dataObj.jarak,
-      kapasitas_penuh: dataObj.kapasitas_penuh,
-    });
-
-    newData
-      .save()
-      .then((data) =>
-        console.log("Data sensor berhasil disimpan ke MongoDB", data),
-      )
-      .catch((err) => console.error("Error menyimpan data sensor:", err));
-  }
+  pingIntervals.set(clientId, pingInterval);
 });
 
 server.listen(PORT, () => {
